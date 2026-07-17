@@ -9,6 +9,7 @@
   "repository": "https://github.com/mikelneonedwin/skills",
   "license": "MIT",
   "skills": [
-    "./skills/productivity/gh-report"
+    "./skills/gh-report",
+    "./skills/scenage"
   ]
 }

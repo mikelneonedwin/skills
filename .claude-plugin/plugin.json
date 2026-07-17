@@ -1,0 +1,11 @@
+{
+  "name": "skills",
+  "version": "1.0.0",
+  "description": "My collection of personal assistant skills, including gh-report and scenage.",
+  "author": {
+    "name": "mikelneonedwin"
+  },
+  "homepage": "https://github.com/mikelneonedwin/skills",
+  "repository": "https://github.com/mikelneonedwin/skills",
+  "license": "MIT"
+}

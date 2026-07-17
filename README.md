@@ -12,5 +12,5 @@ A consolidated repository for my personal assistant skills.
 To install all skills in this repository, run:
 
 ```bash
-agy plugin install https://github.com/mikelneonedwin/skills
+npx skills install https://github.com/mikelneonedwin/skills
 ```

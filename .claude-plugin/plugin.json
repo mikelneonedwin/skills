@@ -7,5 +7,9 @@
   },
   "homepage": "https://github.com/mikelneonedwin/skills",
   "repository": "https://github.com/mikelneonedwin/skills",
-  "license": "MIT"
+  "license": "MIT",
+  "skills": [
+    "./skills/gh-report",
+    "./skills/scenage"
+  ]
 }

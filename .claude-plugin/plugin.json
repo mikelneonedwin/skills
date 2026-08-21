@@ -1,7 +1,7 @@
 {
   "name": "skills",
-  "version": "1.0.0",
-  "description": "My collection of personal assistant skills, including gh-report and scenage.",
+  "version": "1.0.1",
+  "description": "My collection of personal assistant skills",
   "author": {
     "name": "mikelneonedwin"
   },
@@ -10,6 +10,10 @@
   "license": "MIT",
   "skills": [
     "./skills/gh-report",
-    "./skills/scenage"
+    "./skills/scenage",
+    "./skills/we-drizzle",
+    "./skills/we-nestjs",
+    "./skills/we-shadcn",
+    "./skills/we-tanstack-query"
   ]
 }

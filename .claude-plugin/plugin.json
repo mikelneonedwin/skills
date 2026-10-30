@@ -10,6 +10,7 @@
   "license": "MIT",
   "skills": [
     "./skills/gh-report",
+    "./skills/railway-serverless",
     "./skills/reference-driven-frontend",
     "./skills/scenage",
     "./skills/we-drizzle",

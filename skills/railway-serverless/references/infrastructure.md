@@ -47,6 +47,12 @@ To make queue workers compatible with scale-to-0:
    - When queues are empty (`drained` event or startup check with 0 waiting/active/delayed jobs), wait for an idle grace period (e.g. 15 seconds) and set `isPaused = true`.
    - Call `await queue.pause(true, true)` to pause local dequeuing, then call `queue._clearTimers()` to cancel existing `delayTimer`, `guardianTimer`, and `moveUnlockedJobsToWaitInterval` instances. Because `updateDelayTimer` is guarded, no recurring timers or Lua commands will run against Redis while idle.
    - When a job arrives on the `waiting` event or an explicit wake endpoint (`POST /wake`) is called, set `isPaused = false`, call `await queue.resume(true)`, invoke `queue.updateDelayTimer()`, and invoke `queue.startMoveUnlockedJobsToWait()` to restore normal processing.
+7. **Complete socket severance for scale-to-zero**:
+   - Calling `queue.pause(true, true)` and clearing timers stops command execution, but Bull's internal pause handler immediately reconnects the blocking client (`bclient`), leaving persistent TCP connections open across Railway's private network. The Linux TCP stack and ioredis transmit periodic 86-byte keepalive probes over open sockets, which Railway records as outbound traffic and continually resets the 10-minute idle inactivity timer.
+   - To achieve scale-to-zero, idle queues must sever their underlying Redis TCP sockets completely. Before disconnecting, attach dummy error listeners to all queue clients (`queue.clients.forEach(c => c.on('error', () => {}))`) to prevent unhandled rejection events in Node when sockets terminate.
+   - Call `await queue.disconnect()`, which transitions all underlying clients to status `'end'` and closes all open TCP sockets to port 6379.
+   - Protect disconnect and resume operations with mutual promise guards to prevent race conditions during rapid wake/sleep transitions.
+   - On wake or before dispatching new jobs, iterate over `queue.clients`, reconnect any client in `'end'`, `'close'`, or `'wait'` status (`await client.connect()`), and then call `await queue.resume(true)` and restore timers. In producer-only services or controllers, disconnect the queue client immediately after jobs are enqueued.
 
 ## Railway dashboard configuration
 

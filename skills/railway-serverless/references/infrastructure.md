@@ -1,45 +1,48 @@
-# Railway infrastructure checklist
+# Railway infrastructure and background jobs
 
-Settings and background activity that keep a service awake even when the application code is correct. Check these first when a service refuses to sleep.
+Settings, background schedulers, queues, and patterns that keep a service awake even when application request code is correct.
 
 ## Contents
 
-- Healthchecks
-- Scaling configuration
-- Timers and telemetry
-- Persistent connections
-- Finding what keeps a service awake
+- Railway healthchecks
+- Background schedulers and in-process crons
+- On-demand payment reconciliation
+- Queues and workers (Bull / BullMQ)
+- Railway dashboard configuration
 
-## Healthchecks
+## Railway healthchecks
 
-Open the service's Settings, then Healthcheck. If a path is set (`/`, `/health`, `/docs`), Railway requests it every few seconds, which generates packets and resets the 5 minute idle countdown. Remove the path or disable the healthcheck.
+Railway healthchecks run exclusively during deployment phase validation to confirm a new deployment can receive traffic before tearing down the previous replica. Railway does not poll healthcheck paths once a deployment is live. Do not disable or remove deployment healthchecks under the misconception that they prevent scale-to-0.
 
-## Scaling configuration
+## Background schedulers and in-process crons
 
-Under Settings, then Scaling, turn on Serverless (Scale to 0) and set Min Replicas to 0. On an existing service, enabling serverless only takes effect after a new deployment.
+Railway puts containers to sleep based on outbound network inactivity. Inactive services have their processes frozen.
 
-## Timers and telemetry
+- **Frozen processes do not tick**: An in-process `@Cron()` scheduler cannot wake a sleeping service. If a service is asleep at midnight, `@Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)` will not fire.
+- **Background network pings prevent sleep**: A timer that runs a database query or external API call every 5 minutes generates outbound packets, which continuously resets Railway's idle timer and prevents the service from ever sleeping.
+- **Native Railway Cron Schedule**: Move scheduled jobs to dedicated batch worker services configured with a Cron Schedule in Railway's dashboard. Railway starts the container on schedule, executes the command, and tears it down when the process exits.
+- **External HTTP triggers**: If a sleeping service must perform periodic work, trigger it from an external cron dispatcher or un-sleeping worker via an authenticated HTTP request. The incoming HTTP request wakes the container via Railway's proxy, runs the task, and allows it to sleep after 10 minutes of inactivity.
 
-- Framework telemetry sends periodic HTTP requests. Set `NEXT_TELEMETRY_DISABLED=1` for Next.js and check the equivalent switch for Prisma and any other framework in use.
-- Do not run long-polling `setInterval` loops or cron schedulers inside the service. Use Railway cron services, which start a container, run, and exit.
-- Cron expressions inside the app that fire every 1, 5, or 30 minutes should move to a daily schedule or a separate cron service.
+## On-demand payment reconciliation
 
-## Persistent connections
+Instead of running a periodic background cron every 5 to 10 minutes that queries payment providers and keeps the database awake, reconcile reactively:
 
-- Redis `subscribe()` holds a socket open for good, so a service that uses it cannot sleep. Replace it with ephemeral polling or webhooks.
-- Any other long-lived connection (websocket servers, database `LISTEN`, message broker consumers) has the same effect.
+1. **On webhook arrival**: When a payment gateway webhook arrives, finalize transaction state immediately.
+2. **On user request**: When a user visits their course, invoice, or dashboard, trigger an on-demand reconciliation check for pending transactions. This pattern is proven in production (`patnaar` and `modools`).
+3. **Lazy cleanup**: Purge expired tokens, sessions, or temporary records during incoming authenticated requests rather than running a background timer loop.
 
-## Finding what keeps a service awake
+## Queues and workers (Bull / BullMQ)
 
-Work through these in order. The earlier ones are more common.
+A default Bull or BullMQ setup holds persistent Redis subscriber connections and continuous polling loops, keeping both the worker container and the Redis container awake permanently.
 
-1. Healthcheck path configured.
-2. In-app crons or `setInterval`.
-3. Pool with `min > 0`, or no `idleTimeoutMillis`.
-4. Redis client created at import time, or never disconnected when idle.
-5. Orphaned `ioredis` instances left running after a failed connect.
-6. Redis subscribers or other persistent sockets.
-7. Telemetry env vars.
-8. Another service polling this one. Private traffic counts for both ends, so a chatty neighbor keeps this service awake too.
+To make queue workers compatible with scale-to-0:
 
-Item 8 matters when two services both refuse to sleep. Sleeping one may need the other to stop calling it.
+1. **Ephemeral workers**: Run worker processes as separate services configured with scale-to-0, or trigger them via webhooks/cron when work exists.
+2. **Close idle queue connections**: Bull and BullMQ instances maintain three Redis connections (client, subscriber, and bclient). Ensure that when queues are drained, workers unref or pause their listening sockets after an idle threshold rather than blocking indefinitely with `BRPOP`.
+3. **Strict connection parameters in BullModule**: Ensure Redis connections passed to Bull explicitly disable keep-alive (`keepAlive: false as any`), restrict retries, and prevent persistent retries during cold-start phases.
+
+## Railway dashboard configuration
+
+1. Under **Settings -> Scaling**, toggle **Serverless (Scale to 0)** to On and set **Min Replicas = 0**. On an existing service, enabling serverless requires a new deployment to take effect.
+2. Disable framework telemetry: Set `NEXT_TELEMETRY_DISABLED=1` for Next.js, and disable similar telemetry mechanisms in other frameworks that phone home periodically.
+3. Audit both sides of every network link: When Service A and Service B communicate, inspect both service configurations. If Service B refuses to sleep, verify whether Service A is sending periodic pings or polling endpoints.

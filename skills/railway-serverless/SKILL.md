@@ -1,81 +1,64 @@
 ---
 name: railway-serverless
-description: Rules for building, configuring, debugging, or reviewing anything that runs on Railway Serverless (scale-to-0, App Sleeping). Use this skill automatically whenever the task touches Railway serverless, including sleeping or scale-to-0 services, services that will not sleep, cold starts, wake-up latency, ETIMEDOUT or ECONNREFUSED after idle, 502/503 from a sleeping upstream, pg.Pool or Drizzle or Better Auth config, ioredis or Redis clients, inter-service HTTP clients (fetch, axios, ky), in-app crons or setInterval timers, healthchecks, or Railway scaling settings. Trigger even when the user only says "Railway" plus Postgres, Redis, API, worker, or cron and never writes the word "serverless", because a default config in any of these will keep the container awake or fail on wake-up.
+description: Build, configure, audit, or review services on Railway Serverless (scale-to-0, App Sleeping). Covers mutual resilience between callers and callees, Postgres (pg.Pool and postgres.js), Redis (ioredis), idempotent inter-service HTTP (fetch, Axios), background jobs and native Railway cron schedules, on-demand payment reconciliation, queues (Bull/BullMQ), quiet non-spamming logging during wake-up phases, and Railway dashboard configurations.
 ---
 
 # Railway serverless (scale-to-0)
 
-Railway pauses a container after 5 to 10 minutes with no network packets in or out. Private network traffic counts for both ends, so one chatty connection keeps two services awake. Waking a sleeping service takes 2 to 8 seconds, and requests that arrive in that window fail unless the client expects it.
+Railway pauses containers after 5 to 10 minutes of complete outbound network inactivity. Private networking traffic counts against both communicating services, meaning recurring outbound network packets or active TCP probes keep both ends alive indefinitely. Waking an idle container takes 2 to 8 seconds. Any client making a request during that boot window will encounter connection drops or HTTP 502/503 responses unless designed specifically to absorb the cold start.
 
-Every rule below follows from those two facts. Either something generates packets when no one is using the app, or something gives up before the wake-up finishes.
+Configuring serverless is never an isolated per-service setting. It is an ecosystem contract spanning callers, callees, background jobs, database connection pools, cache clients, and operational logging.
 
-## How to use this skill
+## Core principles and system contracts
 
-1. Find which parts of the task touch Postgres, Redis, HTTP calls between services, background timers, or Railway settings.
-2. Read the matching reference file before writing or editing code. The references hold the full reasoning and working implementations to copy from.
-3. Check the work against the rules below. If existing code breaks a rule, say so, even when the user did not ask about it.
-4. For new code, start from the reference implementation instead of writing from memory. The retry logic has a subtle trap (see Postgres) that is easy to reintroduce.
+Every serverless failure traces back to one of three flaws:
 
-| Task involves | Read |
-|---|---|
-| `pg`, Drizzle, Better Auth, any Postgres pool | `references/postgres.md` |
-| `ioredis`, any Redis client | `references/redis.md` |
-| Calls from one service to another (fetch, axios, ky) | `references/http-clients.md` |
-| Crons, timers, workers, healthchecks, telemetry, Railway dashboard settings | `references/infrastructure.md` |
+1. Unintended outbound traffic generation: uncoordinated background timers that query databases or remote services, periodic keep-alive probes, persistent subscriptions, or external pings reset the idle countdown before sleep can occur.
+2. Fragile or non-idempotent callers: upstream callers timing out or failing immediately instead of giving sleeping dependencies time to boot, or blindly retrying mutating operations and duplicating transactions.
+3. Obtrusive logging during cold starts: treating expected initial socket drops as application crashes and spamming logs with false positive error alerts.
 
-## Core rules
+### Caller and callee mutual resilience
 
-### Postgres (`pg.Pool`)
+Scale-to-0 fails when an agent configures Service B to sleep but leaves Service A unprepared for Service B's sleep state.
 
-- Set `min: 0`. Any minimum above zero holds sockets open forever.
-- Set `idleTimeoutMillis: 10000` so idle sockets close 10 seconds after the last request.
-- Set `connectionTimeoutMillis: 15000`. The database needs 5 to 8 seconds to wake, and a 5 second timeout aborts first.
-- Set `max: 10` per replica so a wake-up burst cannot exhaust `max_connections`.
-- Wrap connection acquisition in a retry loop with exponential backoff and jitter. Retry on `ECONNREFUSED`, `ETIMEDOUT`, `EHOSTUNREACH`, `ECONNRESET`, `ENETUNREACH`, and Postgres codes `57P03`, `08006`, `08001`, `08004`.
-- Override both signatures of `pool.connect()`. Drizzle and Better Auth call `pool.query()`, and `pg` implements that with the callback form of `connect(cb)`. A retry that only covers the promise form is skipped by every ORM query, which then fails immediately with `ETIMEDOUT`.
+- Upstream callers must absorb cold starts: If Service A calls Service B, Service A must have an overall HTTP timeout budget of at least 25 to 30 seconds bounding all attempts combined, retrying transient network errors (`ECONNREFUSED`, `ECONNRESET`, `ETIMEDOUT`).
+- Idempotency guardrails: Only idempotent methods (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`) or requests carrying an explicit idempotency key can be retried on socket drops, timeouts, or 502/503 responses. Never retry mutating operations (`POST`, `PATCH`) without an idempotency key, because the upstream service may have committed state before returning an error or dropping the socket.
+- Upstream callers must not poll Service B on an interval: A frequent synchronization poll from Service A resets Service B's idle timer and keeps both services awake.
+- Callees must not hold long-lived connections back to callers: WebSockets, server-sent events, or persistent RPC subscriptions defeat scale-to-0.
 
-### Redis (`ioredis`)
+### Quiet logging during cold-start resilience
 
-- `lazyConnect: true`, so importing the module never opens a socket.
-- `enableOfflineQueue: false` and `maxRetriesPerRequest` of 1 or 2, so commands fail fast instead of buffering forever while Redis wakes.
-- Share one in-flight `connect()` promise between concurrent callers. A second `connect()` call throws, and commands sent while status is `connecting` throw with the offline queue off. Never reset `connectPromise` in the disconnect path. Only its own `finally` clears it.
-- Absorb wake-up with `retryStrategy`, 6 to 8 attempts, 250 ms growing to 3000 ms, plus jitter. Network drops reach `retryStrategy`. `reconnectOnError` only sees command-level error replies, so limit it to `READONLY`.
-- Close idle connections with `client.disconnect()` after 5 to 15 seconds, using an unref'd timer. `quit()` waits on a handshake that a half-closed proxy never answers.
-- On a failed connect, call `disconnect()` on the failed client before dropping the reference. A dropped but undisconnected client keeps retrying in the background and keeps both services awake.
-- `keepAlive: 0` and `autoResendUnfulfilledCommands: false`. Keep-alive probes are packets.
-- No `subscribe()`. A subscriber holds a socket open permanently. Use ephemeral polling or webhooks.
+During a cold start, initial connection failures (`ECONNREFUSED`, `ETIMEDOUT`, `57P03`) are not system outages. They represent normal, expected wake-up latency.
 
-### Calls between services
+- Suppress error and warning logs during retry phases: Do not emit `logger.error` or `logger.warn` on the first few connection attempts while a service or database is waking up.
+- Log only at `debug` level during ongoing retries, or stay completely silent until the retry budget is exhausted.
+- Emit `logger.error` only when maximum retries or the total time budget has been exceeded.
+- Attach an empty or debug-level error listener to EventEmitter clients (such as `ioredis` or `pg`) to prevent Node from throwing unhandled error events or logging stack traces to stderr during routine reconnect attempts.
 
-- Default timeout of 20 to 25 seconds.
-- Retry up to 3 times on 502, 503, `ECONNREFUSED`, `ECONNRESET`, `ETIMEDOUT`. Back off 1s, 2s, 4s with jitter.
+## Step-by-step workflow
 
-### Timers, workers, and settings
+Follow this sequence whenever building, converting, or auditing a service for Railway serverless.
 
-- No in-app `@Cron` or `setInterval` firing every few minutes. Each tick hits the database and resets the idle countdown. Use a daily schedule, a Railway cron service, or an external webhook.
-- Clean up expired rows lazily on incoming requests instead of polling for them.
-- Trigger queue workers when work is enqueued, drain the queue, then go idle. Do not poll the queue on an interval.
-- Remove the healthcheck path in service settings. Railway pings it every few seconds.
-- Confirm Serverless is on and Min Replicas is 0. Turning it on for an existing service needs a new deployment.
-- Disable framework telemetry, for example `NEXT_TELEMETRY_DISABLED=1`.
+1. **Reconnaissance**: Identify all external touchpoints across the service:
+   - Relational database connections (`pg`, `drizzle-orm/node-postgres`, `postgres`, `drizzle-orm/postgres-js`).
+   - Redis or caching clients (`ioredis`, `@nestjs/bull`, `bull`, `bullmq`).
+   - Outbound HTTP calls to sibling microservices or upstream dependencies (`fetch`, `axios`, `ky`).
+   - Schedulers and intervals (`@nestjs/schedule`, `@Cron`, `setInterval`, queue polling loops).
+2. **Consult Reference Implementations**: Read the matching reference file in `references/` before writing code. Reference implementations contain verified concurrency safeguards, timeout bounding, and unref'd timer mechanics:
+   - For PostgreSQL pools and ORMs: read `references/postgres.md`.
+   - For Redis clients and cache managers: read `references/redis.md`.
+   - For internal HTTP calls: read `references/http-clients.md`.
+   - For background timers, queues, payment reconciliation, and dashboard settings: read `references/infrastructure.md`.
+3. **Configure Upstream Callers**: Inspect services that call this service. Verify their request timeouts absorb 20 to 25 seconds of wake-up latency and that network error retries enforce idempotency.
+4. **Audit and Verify**: Verify that no interval loops make outbound network requests, idle sockets close within 10 seconds, healthchecks remain configured for deployment validation, and retry logging remains quiet until failure.
 
-## Reviewing existing code
+## Quick reference checklist
 
-When asked to audit a service, check in this order, because the first hit usually explains a service that never sleeps.
-
-1. Healthcheck path set in Railway.
-2. Crons or intervals inside the app.
-3. Pool config with `min > 0`, no `idleTimeoutMillis`, or a short connection timeout.
-4. Redis client built at import time, or no idle disconnect.
-5. Redis `subscribe()` or other long-lived connections.
-6. Telemetry env vars.
-7. Inter-service clients with short timeouts and no retries.
-
-Report each finding with the file and line, the rule it breaks, and the fix.
-
-## Things to avoid
-
-- Do not raise `min` or add a keep-warm ping to cut cold-start latency. That defeats scale-to-0. The retries and long timeouts exist so the cold start is absorbed instead.
-- Do not put network errors in `reconnectOnError`.
-- Do not use `quit()` for idle cleanup.
-- Do not assume a retry wrapper works until you have checked that it covers `pool.query()`.
+| Surface | Must do | Must avoid |
+|---|---|---|
+| PostgreSQL (`pg.Pool`) | Set `connectionTimeoutMillis: 15000`, intercept both promise and callback `connect()`, release late clients if timed out | Leaving `connectionTimeoutMillis: 0` (indefinite hang), using uncancelled `Promise.race()` |
+| PostgreSQL (`postgres.js`) | Set `connect_timeout: 25`, `idle_timeout: 10`, `max: 10` | Unbounded connection queues, default infinite connection timeouts |
+| Redis (`ioredis`) | Set `lazyConnect: true`, `enableOfflineQueue: false`, `keepAlive: false as any`, reference-count operations, use explicit retry loop for cold starts | Setting `keepAlive: 0` (enables keep-alive), uncoordinated idle timers, relying solely on `retryStrategy` after `connect()` |
+| Inter-service HTTP | Bound overall duration across all retries, preserve caller `AbortSignal`, gate retries by idempotency key or method | Retrying mutating `POST`/`PATCH` without idempotency key, multiplying timeout per attempt |
+| Background tasks & crons | Use native Railway Cron Schedule or reactive on-demand reconciliation on webhook/request | In-process cron loops running every few minutes, expecting an in-process cron to wake a sleeping container |
+| Healthchecks & Dashboard | Leave deployment healthchecks active, toggle Serverless to On with min replicas 0, redeploy | Disabling deployment healthchecks, expecting background health checks that don't exist |

@@ -1,30 +1,33 @@
-# Redis (`ioredis`) on Railway serverless
+# Redis on Railway serverless
 
-Redis sleeps only when no socket to it is open and nothing is retrying in the background.
+Covers `ioredis` in scale-to-0 environments. Both the application and the Redis container can sleep, but only if all TCP keep-alives and background reconnections are completely severed when idle.
 
 ## Contents
 
-- Rules with reasons
-- Reference implementation
-- Using the wrapper
+- Why default Redis clients prevent sleeping
+- The critical rules for `ioredis`
+- Reference counted idle disconnection
+- Resilient cold-start acquisition loop
+- Production reference implementation
 
-## Rules with reasons
+## Why default Redis clients prevent sleeping
 
-1. **`lazyConnect: true`.** A client that connects at import wakes Redis whenever the container starts, even when the request that woke the container never touches Redis. It also throws unhandled rejections if Redis is asleep at that moment.
-2. **`enableOfflineQueue: false` and `maxRetriesPerRequest: 1` or `2`.** By default `ioredis` buffers commands in memory while disconnected, so a request can hang with no error while Redis wakes.
-3. **One shared `connectPromise`.** Calling `connect()` while already connecting throws "Redis is already connecting/connected". Sending commands while `status === "connecting"` with the offline queue off throws "Stream isn't writeable and enableOfflineQueue options is false". Concurrent callers must all await the same promise. Do not null `connectPromise` in `closeConnection()`. The connect attempt's own `finally` does that, which avoids a race when a disconnect lands mid-connect.
-4. **`retryStrategy` for wake-up, not `reconnectOnError`.** While Redis starts, Railway's proxy drops connections (`ECONNREFUSED`, `ECONNRESET`, `ETIMEDOUT`) for 2 to 5 seconds. Socket drops go to `retryStrategy`. `reconnectOnError` only runs for command-level error replies such as `READONLY`. Use 6 to 8 attempts from 250 ms up to 3000 ms with jitter, which gives an 8 to 10 second ceiling.
-5. **`disconnect()` after 5 to 15 seconds idle, never `quit()`.** `quit()` sends `QUIT` and waits for `OK`, which stalls on a half-closed proxy and can leave the socket open. `disconnect()` destroys the stream and cancels reconnect timers. Call `timer.unref()` so the idle timer does not hold the process open.
-6. **Disconnect failed clients.** After a failed `connect()`, call `failedClient.disconnect()`. Setting the variable to `null` leaves the instance alive in memory, still retrying and sending SYN packets across the private network.
-7. **`keepAlive: 0` and `autoResendUnfulfilledCommands: false`.** Keep-alive probes are packets and reset Railway's counter.
-8. **No `subscribe()`.** Subscribers need a permanent socket and cannot scale to zero. Use ephemeral polling or webhooks.
+By default, `ioredis` establishes a persistent TCP socket upon instantiation, enables offline command buffering, and uses background reconnect loops. If an idle application keeps an `ioredis` instance open without tearing down the underlying stream, TCP keep-alives and socket probes generate outbound network traffic that resets Railway's 5 to 10 minute inactivity countdown.
 
-## Reference implementation
+## The critical rules for `ioredis`
 
-Framework-agnostic apart from the NestJS decorators. For Express, Fastify, or plain TypeScript, drop `@Injectable()` and `OnModuleDestroy`, replace `Logger` with the project's logger, and call `closeConnection()` on shutdown.
+1. **`lazyConnect: true`**: Never connect on module evaluation. Connecting at bootstrap wakes Redis when unnecessary and crashes if Redis is currently asleep.
+2. **`enableOfflineQueue: false`**: Fail fast rather than buffering commands indefinitely in memory while disconnected.
+3. **Explicitly disable TCP keep-alive**: In `ioredis`, passing `keepAlive: 0` enables keep-alive probes with Node's default interval, while omitting it can fall back to client defaults (e.g. 30s). To explicitly disable TCP keep-alive on the underlying stream, pass `keepAlive: false as any`.
+4. **Reference-counted idle disconnect**: Track active operations with an in-flight counter. The disconnect timer must only be armed when active operations reach zero, preventing a finished operation from killing the connection while another concurrent operation is still in flight.
+5. **In-flight connection deduplication**: Wrap connection attempts in a single shared Promise (`connectPromise`) so concurrent requests share one attempt.
+6. **Explicit cold-start retry loop**: In `ioredis` with `lazyConnect: true`, calling `connect()` returns a promise that rejects immediately upon initial failure (emitting `ECONNREFUSED` and transitioning status to `reconnecting` or `end`). Wrapping `connect()` in an explicit cold-start retry loop that retries connection establishment over the wake-up window ensures that an initial socket rejection does not cause the application to discard the client prematurely.
+7. **Quiet logging during wake-up**: Suppress error event listeners during reconnect attempts so that initial connection refusals do not trigger false positive crash alerts in monitoring tools.
+
+## Production reference implementation
 
 ```ts
-import { Injectable, OnModuleDestroy, Logger } from "@nestjs/common";
+import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { Redis } from "ioredis";
 
 @Injectable()
@@ -33,7 +36,9 @@ export class ServerlessRedisService implements OnModuleDestroy {
   private client: Redis | null = null;
   private connectPromise: Promise<Redis | null> | null = null;
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly IDLE_TIMEOUT_MS = 10000; // Close socket after 10s of zero activity
+  private activeOperations = 0;
+  private readonly IDLE_TIMEOUT_MS = 10000;
+  private readonly COLD_START_TIMEOUT_MS = 20000;
 
   onModuleDestroy() {
     this.closeConnection();
@@ -48,82 +53,109 @@ export class ServerlessRedisService implements OnModuleDestroy {
 
   private closeConnection() {
     this.clearDisconnectTimer();
-    // Note: Do NOT clear this.connectPromise here. Let its own `finally` block
-    // clear it so an in-flight connection cannot race with a new attempt.
     if (this.client) {
       const clientRef = this.client;
       this.client = null;
-      // Rule #5: Forcefully tear down the TCP socket immediately
+      // Forcefully tear down socket; do not use quit() which waits on an unreplied handshake
       clientRef.disconnect();
     }
   }
 
-  private scheduleDisconnect() {
+  private scheduleDisconnectIfIdle() {
     this.clearDisconnectTimer();
-    this.disconnectTimer = setTimeout(() => {
-      this.logger.log("Closing idle Redis connection to allow Railway scale-to-0");
-      this.closeConnection();
-    }, this.IDLE_TIMEOUT_MS);
-    // Crucial: Unref timer so it does not keep the Node process alive
-    this.disconnectTimer.unref();
+    if (this.activeOperations === 0 && this.client) {
+      this.disconnectTimer = setTimeout(() => {
+        if (this.activeOperations === 0) {
+          this.closeConnection();
+        }
+      }, this.IDLE_TIMEOUT_MS);
+      this.disconnectTimer.unref(); // Does not hold the Node.js event loop open
+    }
   }
 
-  /**
-   * Returns a ready Redis client instance, establishing connection if idle.
-   * Concurrency-safe: Deduplicates in-flight connection attempts across requests.
-   */
+  private createClientInstance(remainingMs: number): Redis {
+    const instance = new Redis(process.env.REDIS_URL!, {
+      lazyConnect: true,
+      enableOfflineQueue: false,
+      maxRetriesPerRequest: 2,
+      connectTimeout: Math.min(5000, Math.max(1000, remainingMs)),
+      // Explicitly disable TCP keep-alive on the underlying stream
+      keepAlive: false as any,
+      autoResendUnfulfilledCommands: false,
+      retryStrategy: null, // Cold-start retries handled by acquireResilientClient
+      reconnectOnError: (err) => err.message.includes("READONLY"),
+    });
+
+    // Silence initial socket errors during cold start wake-up
+    instance.on("error", (err) => {
+      this.logger.debug?.(`[REDIS] Background socket status: ${err.message}`);
+    });
+
+    return instance;
+  }
+
+  private async acquireResilientClient(): Promise<Redis | null> {
+    const startTime = Date.now();
+    let delay = 300;
+    const maxRetries = 6;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const elapsed = Date.now() - startTime;
+      const remainingTime = this.COLD_START_TIMEOUT_MS - elapsed;
+
+      if (remainingTime <= 0) {
+        break;
+      }
+
+      const client = this.createClientInstance(remainingTime);
+
+      try {
+        await client.connect();
+        this.client = client;
+        return client;
+      } catch (err) {
+        client.disconnect();
+
+        const currentElapsed = Date.now() - startTime;
+        const jitter = Math.floor(Math.random() * 150);
+        const nextDelay = delay + jitter;
+
+        if (attempt === maxRetries || currentElapsed + nextDelay >= this.COLD_START_TIMEOUT_MS) {
+          this.logger.error(
+            `[REDIS] Could not connect to Redis after attempt #${attempt} (${currentElapsed}ms elapsed): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          return null;
+        }
+
+        this.logger.debug?.(
+          `[REDIS] Redis waking up (attempt #${attempt}). Retrying in ${nextDelay}ms`,
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, nextDelay));
+        delay = Math.min(delay * 1.8, 3000);
+      }
+    }
+
+    this.logger.error(
+      `[REDIS] Failed to establish Redis connection within ${this.COLD_START_TIMEOUT_MS}ms budget`,
+    );
+    return null;
+  }
+
   private async getClient(): Promise<Redis | null> {
     this.clearDisconnectTimer();
 
-    // 1. Create client instance if not present
-    if (!this.client) {
-      this.client = new Redis(process.env.REDIS_URL!, {
-        lazyConnect: true,          // Rule #1: Never connect on instantiation
-        enableOfflineQueue: false,  // Rule #2: Fail fast rather than hanging
-        maxRetriesPerRequest: 2,
-        connectTimeout: 5000,
-        keepAlive: 0,               // Rule #7: Disable idle keepalive probes
-        autoResendUnfulfilledCommands: false,
-        retryStrategy: (times) => { // Rule #4: Absorb cold-start wake-up latency
-          const maxRetries = 8;
-          if (times > maxRetries) {
-            this.logger.error(`[REDIS] Exceeded max connection retries (${maxRetries}).`);
-            return null; // Stop retrying and trigger connect rejection
-          }
-          const delay = Math.min(250 * Math.pow(2, times - 1), 3000);
-          const jitter = Math.floor(Math.random() * 150);
-          return delay + jitter;
-        },
-        // Rule #4: reconnectOnError is reserved solely for application-level Redis errors (like replica failovers)
-        reconnectOnError: (err) => err.message.includes("READONLY"),
-      });
-
-      this.client.on("error", (err) => {
-        this.logger.error("[REDIS] Socket error:", err.message);
-      });
-    }
-
-    // 2. Return immediately if ready
-    if (this.client.status === "ready") {
+    if (this.client && this.client.status === "ready") {
       return this.client;
     }
 
-    // 3. Rule #3: Deduplicate in-flight connection promises across concurrent callers
     if (!this.connectPromise) {
       this.connectPromise = (async () => {
         try {
-          if (!this.client) return null;
-          await this.client.connect();
-          return this.client;
-        } catch (error) {
-          this.logger.error("[REDIS] Failed to connect:", error);
-          // Rule #6: Explicitly disconnect failed instance so it does not retry in background
-          const failedClient = this.client;
-          this.client = null;
-          failedClient?.disconnect();
-          return null;
+          return await this.acquireResilientClient();
         } finally {
-          // Promise cleans itself up when finished
           this.connectPromise = null;
         }
       })();
@@ -137,6 +169,8 @@ export class ServerlessRedisService implements OnModuleDestroy {
    * Ensures the connection is acquired safely and schedules idle disconnect upon completion.
    */
   async execute<T>(operation: (client: Redis) => Promise<T>): Promise<T | null> {
+    this.activeOperations++;
+    this.clearDisconnectTimer();
     try {
       const client = await this.getClient();
       if (!client) {
@@ -144,19 +178,9 @@ export class ServerlessRedisService implements OnModuleDestroy {
       }
       return await operation(client);
     } finally {
-      // Schedule socket closure once the operation completes
-      this.scheduleDisconnect();
+      this.activeOperations = Math.max(0, this.activeOperations - 1);
+      this.scheduleDisconnectIfIdle();
     }
   }
 }
 ```
-
-## Using the wrapper
-
-Send every Redis command through `execute()` so the idle timer restarts after each operation.
-
-```ts
-const value = await redisService.execute((client) => client.get("session:123"));
-```
-
-`execute()` returns `null` when Redis is unavailable after retries, and callers should handle that case. Decide per call whether a cache miss, a skipped rate limit, or an error is the right outcome.

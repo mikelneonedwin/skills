@@ -1,29 +1,97 @@
 # Inter-service HTTP on Railway serverless
 
-When an upstream service sleeps, the first request meets a cold start. Starting the container, booting Node, NestJS, or Next.js, and running init hooks takes 2 to 8 seconds. During that time Railway's router either drops the connection (`ECONNREFUSED`, `ECONNRESET`, `ETIMEDOUT`) or returns `502` or `503`. A client with a 3 to 5 second timeout and no retries passes that failure straight to the end user.
+When an upstream service sleeps, incoming requests meet a cold start taking 2 to 8 seconds. During that time, Railway's proxy either drops connections (`ECONNREFUSED`, `ECONNRESET`, `ETIMEDOUT`) or returns HTTP `502` or `503`. Callers must absorb this latency without multiplying timeouts or duplicating mutating requests.
 
 ## Contents
 
-- Rules
-- Native fetch
-- Axios and @nestjs/axios
-- ky
+- Critical rules
+- Native fetch implementation
+- Axios / @nestjs/axios implementation
 
-## Rules
+## Critical rules
 
-1. **Timeout of 20 to 25 seconds** on internal calls. A shorter timeout aborts requests just before the upstream finishes booting.
-2. **Retry up to 3 times** on `502`, `503`, `ECONNREFUSED`, `ECONNRESET`, and `ETIMEDOUT`. Back off 1s, 2s, 4s with about 200 ms of jitter. The second or third attempt usually succeeds without the caller noticing.
+1. **Bounded overall deadline**: Enforce a single total timeout (e.g. 25 seconds) bounding all retries, backoff delays, and network execution combined. Dynamically adjust each attempt's timeout to the remaining budget.
+2. **Strict idempotency guardrails**: Never retry non-idempotent operations (`POST`, `PATCH`) on socket drops, timeouts, or 502/503 responses unless an explicit idempotency key (`Idempotency-Key` or `X-Idempotency-Key`) is present. An upstream application may have processed and committed a transaction before encountering an error.
+3. **Transient error classification**: Inspect error codes (including nested `cause.code`) to verify transient network failures (`ECONNREFUSED`, `ECONNRESET`, `ETIMEDOUT`, `EHOSTUNREACH`, `ENETUNREACH`, `UND_ERR_CONNECT_TIMEOUT`). Fail fast on client-side errors like `TypeError` or invalid URLs.
+4. **Preserve caller cancellations**: Merge internal timeout abort controllers with caller-supplied `AbortSignal` instances using `AbortSignal.any` or a robust event-listener fallback.
 
-Retrying non-idempotent requests (POST that creates something) can duplicate work if the first attempt reached the upstream. 502 and 503 from the router mean the request did not reach the app, so retrying them is safe. For timeouts on non-idempotent calls, add an idempotency key or limit retries to the status-code cases.
-
-## Native fetch
+## Native fetch implementation
 
 ```ts
 export interface FetchRetryOptions extends RequestInit {
-  retries?: number;        // default: 3
-  backoffMs?: number;      // default: 1000
-  maxBackoffMs?: number;   // default: 4000
-  timeoutMs?: number;      // default: 20000 (absorb cold start)
+  retries?: number;
+  backoffMs?: number;
+  maxBackoffMs?: number;
+  totalTimeoutMs?: number;
+}
+
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]);
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+function isTransientNetworkError(err: any): boolean {
+  if (!err) return false;
+  const code = err.code ?? err.cause?.code;
+  if (code && TRANSIENT_NETWORK_CODES.has(code)) return true;
+  const msg = String(err.message ?? "").toLowerCase();
+  return msg.includes("fetch failed") || msg.includes("network error") || msg.includes("socket");
+}
+
+function hasIdempotencyKey(headers?: HeadersInit): boolean {
+  if (!headers) return false;
+  if (headers instanceof Headers) {
+    return headers.has("idempotency-key") || headers.has("x-idempotency-key");
+  }
+  if (Array.isArray(headers)) {
+    return headers.some(([key]) => {
+      const lower = key.toLowerCase();
+      return lower === "idempotency-key" || lower === "x-idempotency-key";
+    });
+  }
+  return Object.keys(headers).some((key) => {
+    const lower = key.toLowerCase();
+    return lower === "idempotency-key" || lower === "x-idempotency-key";
+  });
+}
+
+function combineSignals(signals: (AbortSignal | undefined | null)[]): {
+  signal: AbortSignal;
+  cleanup: () => void;
+} {
+  const activeSignals = signals.filter(Boolean) as AbortSignal[];
+  if (typeof AbortSignal !== "undefined" && typeof (AbortSignal as any).any === "function") {
+    return {
+      signal: (AbortSignal as any).any(activeSignals),
+      cleanup: () => {},
+    };
+  }
+
+  const controller = new AbortController();
+  const onAbort = (evt: Event) => {
+    controller.abort((evt.target as AbortSignal).reason);
+    cleanup();
+  };
+
+  const cleanup = () => {
+    activeSignals.forEach((sig) => sig.removeEventListener("abort", onAbort));
+  };
+
+  for (const sig of activeSignals) {
+    if (sig.aborted) {
+      controller.abort(sig.reason);
+      return { signal: controller.signal, cleanup: () => {} };
+    }
+    sig.addEventListener("abort", onAbort, { once: true });
+  }
+
+  return { signal: controller.signal, cleanup };
 }
 
 export async function fetchWithRetry(
@@ -34,57 +102,110 @@ export async function fetchWithRetry(
     retries = 3,
     backoffMs = 1000,
     maxBackoffMs = 4000,
-    timeoutMs = 20000,
+    totalTimeoutMs = 25000,
+    signal: callerSignal,
     ...fetchInit
   } = options;
 
+  const method = (fetchInit.method ?? "GET").toUpperCase();
+  const isIdempotent = IDEMPOTENT_METHODS.has(method) || hasIdempotencyKey(fetchInit.headers);
+  const startTime = Date.now();
   let attempt = 0;
+
   while (true) {
     attempt++;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const elapsed = Date.now() - startTime;
+    const remainingTime = totalTimeoutMs - elapsed;
+
+    if (remainingTime <= 0) {
+      throw new Error(`fetchWithRetry: total timeout of ${totalTimeoutMs}ms exceeded`);
+    }
+
+    const timeoutController = new AbortController();
+    const timeoutTimer = setTimeout(() => {
+      timeoutController.abort(new Error(`Attempt timed out (${remainingTime}ms remaining)`));
+    }, remainingTime);
+
+    const { signal: combinedSignal, cleanup: cleanupSignals } = combineSignals([
+      timeoutController.signal,
+      callerSignal,
+    ]);
 
     try {
       const response = await fetch(url, {
         ...fetchInit,
-        signal: controller.signal,
+        signal: combinedSignal,
       });
 
-      if ((response.status === 502 || response.status === 503) && attempt <= retries) {
-        throw new Error(`Cold-start HTTP ${response.status}`);
+      const isColdStatus = response.status === 502 || response.status === 503;
+      if (isColdStatus && isIdempotent && attempt <= retries) {
+        throw new Error(`Upstream cold start HTTP ${response.status}`);
       }
 
       return response;
     } catch (err: any) {
-      if (attempt > retries) {
+      if (callerSignal?.aborted) {
         throw err;
       }
+
+      const isColdStatus =
+        err?.message?.includes("HTTP 502") || err?.message?.includes("HTTP 503");
+      const isTransient = isColdStatus || isTransientNetworkError(err);
+
+      if (!isTransient || !isIdempotent || attempt > retries) {
+        throw err;
+      }
+
       const delay =
         Math.min(backoffMs * Math.pow(2, attempt - 1), maxBackoffMs) +
         Math.random() * 200;
+
+      if (Date.now() - startTime + delay >= totalTimeoutMs) {
+        throw err;
+      }
+
       await new Promise((resolve) => setTimeout(resolve, delay));
     } finally {
-      clearTimeout(timer);
+      clearTimeout(timeoutTimer);
+      cleanupSignals();
     }
   }
 }
 ```
 
-## Axios and @nestjs/axios
+## Axios / @nestjs/axios implementation
 
 ```ts
-import { Module, OnModuleInit, Logger } from '@nestjs/common';
-import { HttpModule, HttpService } from '@nestjs/axios';
-import type { AxiosError, InternalAxiosRequestConfig } from 'axios';
+import { Module, OnModuleInit, Logger } from "@nestjs/common";
+import { HttpModule, HttpService } from "@nestjs/axios";
+import type { AxiosError, InternalAxiosRequestConfig } from "axios";
 
 interface RetryAxiosRequestConfig extends InternalAxiosRequestConfig {
   __retryCount?: number;
+  __startTime?: number;
+  __totalTimeoutMs?: number;
+}
+
+const IDEMPOTENT_METHODS = new Set(["get", "head", "options", "put", "delete"]);
+
+function getHeaderCaseInsensitive(config: InternalAxiosRequestConfig, name: string): string | undefined {
+  if (!config.headers) return undefined;
+  if (typeof config.headers.get === "function") {
+    const val = config.headers.get(name);
+    return val ? String(val) : undefined;
+  }
+  const target = name.toLowerCase();
+  for (const [key, value] of Object.entries(config.headers)) {
+    if (key.toLowerCase() === target) {
+      return value ? String(value) : undefined;
+    }
+  }
+  return undefined;
 }
 
 @Module({
   imports: [
     HttpModule.register({
-      timeout: 25000, // 25s timeout to absorb cold-start latency
       maxRedirects: 5,
     }),
   ],
@@ -98,11 +219,25 @@ export class ResilientHttpModule implements OnModuleInit {
   onModuleInit() {
     const axiosInstance = this.httpService.axiosRef;
 
+    axiosInstance.interceptors.request.use((config: RetryAxiosRequestConfig) => {
+      config.__startTime = config.__startTime ?? Date.now();
+      config.__totalTimeoutMs = config.__totalTimeoutMs ?? 25000;
+
+      const elapsed = Date.now() - config.__startTime;
+      const remainingTime = config.__totalTimeoutMs - elapsed;
+
+      // Adjust individual attempt timeout to exact remaining budget
+      config.timeout = Math.max(1, remainingTime);
+      return config;
+    });
+
     axiosInstance.interceptors.response.use(
       (response) => response,
       async (error: AxiosError) => {
         const config = error.config as RetryAxiosRequestConfig | undefined;
-        if (!config) return Promise.reject(error);
+        if (!config || !config.__startTime || !config.__totalTimeoutMs) {
+          return Promise.reject(error);
+        }
 
         config.__retryCount = config.__retryCount ?? 0;
         const maxRetries = 3;
@@ -110,19 +245,39 @@ export class ResilientHttpModule implements OnModuleInit {
         const isColdStartStatus = status === 502 || status === 503;
         const isNetworkError =
           !error.response &&
-          (error.code === 'ECONNREFUSED' ||
-            error.code === 'ECONNRESET' ||
-            error.code === 'ETIMEDOUT' ||
-            error.message.includes('timeout'));
+          (error.code === "ECONNREFUSED" ||
+            error.code === "ECONNRESET" ||
+            error.code === "ETIMEDOUT" ||
+            error.message.includes("timeout"));
 
+        const method = (config.method ?? "get").toLowerCase();
+        const hasIdempotencyKey = Boolean(
+          getHeaderCaseInsensitive(config, "idempotency-key") ||
+            getHeaderCaseInsensitive(config, "x-idempotency-key"),
+        );
+        const isIdempotent = IDEMPOTENT_METHODS.has(method) || hasIdempotencyKey;
+
+        if (!isIdempotent) {
+          return Promise.reject(error);
+        }
+
+        const elapsed = Date.now() - config.__startTime;
         if ((isColdStartStatus || isNetworkError) && config.__retryCount < maxRetries) {
           config.__retryCount += 1;
           const delay =
             Math.min(1000 * Math.pow(2, config.__retryCount - 1), 4000) +
             Math.random() * 200;
 
+          if (elapsed + delay >= config.__totalTimeoutMs) {
+            return Promise.reject(error);
+          }
+
+          this.logger.debug?.(
+            `[HTTP] Upstream waking up (${status || error.code}). Retry #${config.__retryCount} in ${Math.round(delay)}ms`,
+          );
+
           await new Promise((resolve) => setTimeout(resolve, delay));
-          return axiosInstance.request(config);
+          return axiosInstance(config);
         }
 
         return Promise.reject(error);
@@ -130,22 +285,4 @@ export class ResilientHttpModule implements OnModuleInit {
     );
   }
 }
-```
-
-## ky
-
-```ts
-import ky from 'ky';
-
-export const apiClient = ky.create({
-  timeout: 25000,
-  retry: {
-    limit: 3,
-    statusCodes: [502, 503],
-    methods: ['get', 'post', 'put', 'delete', 'patch', 'head'],
-    backoffLimit: 4000,
-    delay: (attemptCount) =>
-      Math.min(1000 * Math.pow(2, attemptCount - 1), 4000) + Math.random() * 200,
-  },
-});
 ```
